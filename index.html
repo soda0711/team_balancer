@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SPLAT DRAFT - チーム分けツール</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #12132a; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo } = React;
+
+const TEAM_A_NAME = "イカチーム";
+const TEAM_B_NAME = "タコチーム";
+const TEAM_A_COLOR = "#2fe6e0";
+const TEAM_B_COLOR = "#ff4fa3";
+
+function combinationsOfSize(arr, k) {
+  const results = [];
+  const n = arr.length;
+  function helper(start, combo) {
+    if (combo.length === k) {
+      results.push([...combo]);
+      return;
+    }
+    for (let i = start; i < n; i++) {
+      combo.push(arr[i]);
+      helper(i + 1, combo);
+      combo.pop();
+    }
+  }
+  helper(0, []);
+  return results;
+}
+
+function pairKey(a, b) {
+  return [a, b].sort().join("|");
+}
+
+function buildConflictSets(history) {
+  const recent = history.slice(-2);
+  const teammatePairs = new Map();
+  const opponentPairs = new Map();
+  recent.forEach((m, idx) => {
+    const weight = idx === recent.length - 1 ? 2 : 1;
+    const addPairs = (ids, map) => {
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          const k = pairKey(ids[i], ids[j]);
+          map.set(k, (map.get(k) || 0) + weight);
+        }
+      }
+    };
+    addPairs(m.teamA, teammatePairs);
+    addPairs(m.teamB, teammatePairs);
+    m.teamA.forEach((a) => {
+      m.teamB.forEach((b) => {
+        const k = pairKey(a, b);
+        opponentPairs.set(k, (opponentPairs.get(k) || 0) + weight);
+      });
+    });
+  });
+  return { teammatePairs, opponentPairs };
+}
+
+function generateMatch(players, history) {
+  const ids = players.map((p) => p.id);
+  const winsById = Object.fromEntries(players.map((p) => [p.id, p.wins]));
+  const { teammatePairs, opponentPairs } = buildConflictSets(history);
+
+  const others = ids.slice(1);
+  const combosOfOthers = combinationsOfSize(others, 3);
+  const partitions = combosOfOthers.map((c) => {
+    const combo = [ids[0], ...c];
+    const comboSet = new Set(combo);
+    const complement = ids.filter((id) => !comboSet.has(id));
+    return { combo, complement };
+  });
+
+  let bestDiff = Infinity;
+  let diffCandidates = [];
+  partitions.forEach(({ combo, complement }) => {
+    const sumA = combo.reduce((s, id) => s + winsById[id], 0);
+    const sumB = complement.reduce((s, id) => s + winsById[id], 0);
+    const diff = Math.abs(sumA - sumB);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      diffCandidates = [{ combo, complement }];
+    } else if (diff === bestDiff) {
+      diffCandidates.push({ combo, complement });
+    }
+  });
+
+  let bestConflict = Infinity;
+  let bestSet = [];
+  diffCandidates.forEach(({ combo, complement }) => {
+    let conflict = 0;
+    const scoreTeam = (ids4) => {
+      for (let i = 0; i < ids4.length; i++) {
+        for (let j = i + 1; j < ids4.length; j++) {
+          conflict += (teammatePairs.get(pairKey(ids4[i], ids4[j])) || 0) * 2;
+        }
+      }
+    };
+    scoreTeam(combo);
+    scoreTeam(complement);
+    combo.forEach((a) => {
+      complement.forEach((b) => {
+        conflict += opponentPairs.get(pairKey(a, b)) || 0;
+      });
+    });
+    if (conflict < bestConflict) {
+      bestConflict = conflict;
+      bestSet = [{ combo, complement }];
+    } else if (conflict === bestConflict) {
+      bestSet.push({ combo, complement });
+    }
+  });
+
+  const chosen = bestSet[Math.floor(Math.random() * bestSet.length)];
+  const flip = Math.random() < 0.5;
+  const teamA = flip ? chosen.complement : chosen.combo;
+  const teamB = flip ? chosen.combo : chosen.complement;
+  return { teamA, teamB };
+}
+
+function InkBlob({ style }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        filter: "blur(40px)",
+        opacity: 0.35,
+        pointerEvents: "none",
+        ...style,
+      }}
+    />
+  );
+}
+
+function SplatTeamBalancer() {
+  const [phase, setPhase] = useState("setup");
+  const [names, setNames] = useState(Array(8).fill(""));
+  const [players, setPlayers] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [currentMatch, setCurrentMatch] = useState(null);
+  const [splash, setSplash] = useState(null);
+
+  const canStart = names.every((n) => n.trim().length > 0);
+
+  function handleNameChange(i, value) {
+    const next = [...names];
+    next[i] = value;
+    setNames(next);
+  }
+
+  function handleStart() {
+    const initPlayers = names.map((n, i) => ({
+      id: `p${i}`,
+      name: n.trim(),
+      wins: 0,
+    }));
+    setPlayers(initPlayers);
+    setHistory([]);
+    setCurrentMatch(generateMatch(initPlayers, []));
+    setPhase("match");
+  }
+
+  function handleWinner(side) {
+    const winningIds = new Set(currentMatch[side === "A" ? "teamA" : "teamB"]);
+    const updatedPlayers = players.map((p) =>
+      winningIds.has(p.id) ? { ...p, wins: p.wins + 1 } : p
+    );
+    const newHistory = [
+      ...history,
+      { teamA: currentMatch.teamA, teamB: currentMatch.teamB, winner: side },
+    ];
+    setPlayers(updatedPlayers);
+    setHistory(newHistory);
+    setSplash({ color: side === "A" ? TEAM_A_COLOR : TEAM_B_COLOR, key: Date.now() });
+    setCurrentMatch(generateMatch(updatedPlayers, newHistory));
+  }
+
+  function handleReset() {
+    setPhase("setup");
+    setNames(Array(8).fill(""));
+    setPlayers([]);
+    setHistory([]);
+    setCurrentMatch(null);
+    setSplash(null);
+  }
+
+  const playerById = useMemo(
+    () => Object.fromEntries(players.map((p) => [p.id, p])),
+    [players]
+  );
+  const sortedPlayers = useMemo(
+    () => [...players].sort((a, b) => b.wins - a.wins),
+    [players]
+  );
+  const maxWins = Math.max(1, ...players.map((p) => p.wins));
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#12132a",
+        color: "#f4f3ec",
+        fontFamily: "'Rubik', sans-serif",
+        position: "relative",
+        overflow: "hidden",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Rubik+Mono+One&family=Rubik:wght@400;500;700;900&display=swap');
+        .display-font { font-family: 'Rubik Mono One', sans-serif; }
+        @keyframes splat {
+          0% { transform: scale(0); opacity: 0.55; }
+          70% { opacity: 0.35; }
+          100% { transform: scale(1); opacity: 0; }
+        }
+        .splash-circle {
+          position: fixed;
+          top: 50%; left: 50%;
+          width: 140vmax; height: 140vmax;
+          border-radius: 9999px;
+          transform: translate(-50%, -50%) scale(0);
+          pointer-events: none;
+          z-index: 0;
+          animation: splat 0.9s ease-out forwards;
+        }
+        .team-card { transition: transform 0.2s ease; }
+        .team-card:hover { transform: translateY(-2px); }
+        input:focus { outline: 2px solid #ffe94f; }
+        button:focus-visible { outline: 2px solid #ffe94f; outline-offset: 2px; }
+      `}</style>
+
+      <InkBlob
+        style={{
+          width: 420,
+          height: 420,
+          top: -140,
+          left: -140,
+          background: TEAM_A_COLOR,
+          borderRadius: "42% 58% 63% 37% / 41% 44% 56% 59%",
+        }}
+      />
+      <InkBlob
+        style={{
+          width: 380,
+          height: 380,
+          bottom: -120,
+          right: -120,
+          background: TEAM_B_COLOR,
+          borderRadius: "58% 42% 37% 63% / 55% 60% 40% 45%",
+        }}
+      />
+
+      {splash && (
+        <div
+          key={splash.key}
+          className="splash-circle"
+          style={{ background: splash.color }}
+        />
+      )}
+
+      <div
+        style={{
+          position: "relative",
+          zIndex: 1,
+          maxWidth: 480,
+          margin: "0 auto",
+          padding: "28px 18px 60px",
+        }}
+      >
+        <header style={{ textAlign: "center", marginBottom: 28 }}>
+          <div
+            className="display-font"
+            style={{
+              fontSize: 30,
+              letterSpacing: 1,
+              lineHeight: 1.2,
+              background: `linear-gradient(90deg, ${TEAM_A_COLOR}, ${TEAM_B_COLOR})`,
+              WebkitBackgroundClip: "text",
+              WebkitTextFillColor: "transparent",
+            }}
+          >
+            SPLAT DRAFT
+          </div>
+          <div style={{ fontSize: 13, opacity: 0.65, marginTop: 6 }}>
+            勝利数バランス チーム分けツール
+          </div>
+        </header>
+
+        {phase === "setup" && (
+          <div>
+            <p style={{ fontSize: 14, opacity: 0.8, marginBottom: 16 }}>
+              8人のプレイヤー名を入力してください。
+            </p>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: 10,
+                marginBottom: 22,
+              }}
+            >
+              {names.map((n, i) => (
+                <input
+                  key={i}
+                  value={n}
+                  onChange={(e) => handleNameChange(i, e.target.value)}
+                  placeholder={`プレイヤー${i + 1}`}
+                  style={{
+                    background: "rgba(255,255,255,0.06)",
+                    border: "1px solid rgba(255,255,255,0.15)",
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    color: "#f4f3ec",
+                    fontSize: 14,
+                  }}
+                />
+              ))}
+            </div>
+            <button
+              disabled={!canStart}
+              onClick={handleStart}
+              className="display-font"
+              style={{
+                width: "100%",
+                padding: "14px 0",
+                borderRadius: 12,
+                border: "none",
+                fontSize: 15,
+                letterSpacing: 0.5,
+                color: "#12132a",
+                background: canStart
+                  ? `linear-gradient(90deg, ${TEAM_A_COLOR}, ${TEAM_B_COLOR})`
+                  : "rgba(255,255,255,0.15)",
+                cursor: canStart ? "pointer" : "not-allowed",
+                opacity: canStart ? 1 : 0.5,
+              }}
+            >
+              マッチ開始
+            </button>
+          </div>
+        )}
+
+        {phase === "match" && currentMatch && (
+          <div>
+            <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>
+              <TeamCard
+                label={TEAM_A_NAME}
+                color={TEAM_A_COLOR}
+                members={currentMatch.teamA.map((id) => playerById[id])}
+                onWin={() => handleWinner("A")}
+              />
+              <TeamCard
+                label={TEAM_B_NAME}
+                color={TEAM_B_COLOR}
+                members={currentMatch.teamB.map((id) => playerById[id])}
+                onWin={() => handleWinner("B")}
+              />
+            </div>
+
+            <div
+              style={{
+                background: "rgba(255,255,255,0.05)",
+                borderRadius: 14,
+                padding: "14px 16px",
+                marginBottom: 16,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  opacity: 0.6,
+                  marginBottom: 10,
+                  letterSpacing: 0.5,
+                }}
+              >
+                勝利数
+              </div>
+              {sortedPlayers.map((p) => (
+                <div
+                  key={p.id}
+                  style={{ display: "flex", alignItems: "center", marginBottom: 6 }}
+                >
+                  <div style={{ width: 90, fontSize: 13, opacity: 0.9 }}>
+                    {p.name}
+                  </div>
+                  <div
+                    style={{
+                      flex: 1,
+                      height: 8,
+                      borderRadius: 999,
+                      background: "rgba(255,255,255,0.08)",
+                      overflow: "hidden",
+                      marginRight: 8,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(p.wins / maxWins) * 100}%`,
+                        height: "100%",
+                        background: `linear-gradient(90deg, ${TEAM_A_COLOR}, ${TEAM_B_COLOR})`,
+                        borderRadius: 999,
+                      }}
+                    />
+                  </div>
+                  <div style={{ width: 20, fontSize: 12, textAlign: "right" }}>
+                    {p.wins}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {history.length > 0 && (
+              <div
+                style={{
+                  fontSize: 12,
+                  opacity: 0.6,
+                  marginBottom: 24,
+                  lineHeight: 1.8,
+                }}
+              >
+                <div style={{ marginBottom: 4, letterSpacing: 0.5 }}>
+                  対戦履歴 (直近5試合)
+                </div>
+                {history
+                  .slice(-5)
+                  .reverse()
+                  .map((m, i) => {
+                    const matchNo = history.length - i;
+                    const winnerName = m.winner === "A" ? TEAM_A_NAME : TEAM_B_NAME;
+                    return (
+                      <div key={matchNo}>
+                        第{matchNo}試合: {winnerName} の勝利
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+
+            <button
+              onClick={handleReset}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                margin: "0 auto",
+                background: "none",
+                border: "1px solid rgba(255,255,255,0.2)",
+                color: "rgba(255,255,255,0.7)",
+                borderRadius: 10,
+                padding: "8px 14px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              <span>↺</span>
+              セッションをリセット
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TeamCard({ label, color, members, onWin }) {
+  return (
+    <div
+      className="team-card"
+      style={{
+        flex: 1,
+        background: `${color}1a`,
+        border: `1px solid ${color}55`,
+        borderRadius: 16,
+        padding: "14px 12px",
+      }}
+    >
+      <div
+        className="display-font"
+        style={{ fontSize: 14, color, marginBottom: 10, letterSpacing: 0.5 }}
+      >
+        {label}
+      </div>
+      {members.map((m) => (
+        <div
+          key={m.id}
+          style={{
+            fontSize: 13,
+            padding: "5px 0",
+            borderBottom: "1px solid rgba(255,255,255,0.08)",
+            display: "flex",
+            justifyContent: "space-between",
+          }}
+        >
+          <span>{m.name}</span>
+          <span style={{ opacity: 0.55 }}>{m.wins}勝</span>
+        </div>
+      ))}
+      <button
+        onClick={onWin}
+        style={{
+          width: "100%",
+          marginTop: 12,
+          padding: "9px 0",
+          borderRadius: 10,
+          border: "none",
+          background: color,
+          color: "#12132a",
+          fontWeight: 700,
+          fontSize: 12,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 6,
+          cursor: "pointer",
+        }}
+      >
+        <span>🏆</span>
+        {label}の勝利
+      </button>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<SplatTeamBalancer />);
+</script>
+</body>
+</html>
